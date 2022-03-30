@@ -1,0 +1,2449 @@
+---
+title: "VDAY Predictions"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Setup Banner Connection}
+# create JDBC driver
+drv <- JDBC(driverClass="oracle.jdbc.driver.OracleDriver", # Oracle thin driver name
+            classPath = "C:/Users/tfarkas/Oracle/ojdbc6.jar" ) # path to JDBC driver 
+
+# make connection to Oracle database, here PRGM (modify if necessary)
+
+prgm <- dbConnect(drv, 
+                  url="jdbc:oracle:thin:@//oradev.admin.ad.cnm.edu/prgm.admin.ad.cnm.edu", # from ITS 
+                  user=getPass(msg="username: "), password=getPass()) # credentials
+```
+
+```{r Get Banner Tables}
+
+# get term information
+terms <- dbGetQuery(conn = prgm, statement = {"
+  
+  SELECT  DISTINCT
+          terms.TERM_CODE
+        , terms.TERM_SEQUENCE
+        , terms.SEMESTER
+        , rsts.SFRRSTS_START_DATE AS REG_START
+        , terms.START_DATE
+        , terms.CENSUS            AS CENSUS_DATE
+  FROM    CHELINK.TERMS_AND_SEMESTERS terms
+  JOIN    CHELINK.VDAY_SUMMARY vday
+     ON  terms.TERM_CODE = vday.TERM_CODE
+  JOIN    SATURN.SFRRSTS rsts
+      ON  terms.TERM_CODE = rsts.SFRRSTS_TERM_CODE
+    AND   rsts.SFRRSTS_PTRM_CODE IN ('1', '300')  
+    AND   rsts.SFRRSTS_RSTS_CODE = 'RW'
+  ORDER BY TERM_SEQUENCE
+
+
+"}) %>% 
+  mutate_at(vars(SEMESTER), funs(recode(., "F" = "Fall", "S" = "Spring", "R" = "Summer")))
+
+# get vday summary information (headcount, sch)
+vday_sum_raw <- dbGetQuery(conn = prgm, statement = {"
+  
+ SELECT   vday.TERM_CODE   term
+      ,   vday.DDAY        
+      ,   vday.VDAY        
+      ,   vday.RDAY        
+      ,   vday.HEADCOUNT   AS head
+      ,   vday.SCH_COUNT   AS sch
+ FROM     CHELINK.VDAY_SUMMARY vday
+
+"}) %>%
+  full_join(terms, by=c("TERM" = "TERM_CODE")) %>%
+  mutate_at(vars(DDAY, REG_START, START_DATE, CENSUS_DATE), funs(base::as.Date(.))) %>%
+  filter(DDAY >= REG_START, DDAY <= CENSUS_DATE) %>%
+  mutate_at(vars(VDAY), funs(ifelse(. >= 1, .-1, .))) %>% # VDAY 1 => VDAY 0
+  mutate_at(vars(TERM_SEQUENCE), funs(as.numeric(.))) %>%
+  group_by(TERM) %>%
+  mutate(SDAY = round(1- (VDAY / (min(VDAY))), 4)) %>% # calculate SDAY
+  ungroup() %>%
+  arrange(TERM, DDAY)
+
+
+term_stats <- dbGetQuery(conn = prgm, statement = {"
+  
+  SELECT  terms.TERM_CODE   AS TERM
+      ,   vday_s.HEADCOUNT  AS HEAD_START
+      ,   vday_s.SCH_COUNT  AS SCH_START
+
+  FROM    CHELINK.TERMS_AND_SEMESTERS terms
+  JOIN    CHELINK.VDAY_SUMMARY vday_s
+      ON  terms.TERM_CODE = vday_s.TERM_CODE
+      AND terms.START_DATE= vday_s.DDAY
+  ORDER BY terms.TERM_CODE
+
+"})
+
+census_hcs <- dbGetQuery(conn = prgm, statement = {"
+  
+  SELECT ccst.TERM_CODE      as term
+      ,   COUNT(PIDM)   as headcount
+  FROM    CHELINK.COMBINED_STUDENT_TABLE ccst
+  JOIN    CHELINK.TERMS_AND_SEMESTERS term
+      ON  ccst.TERM_CODE = term.TERM_CODE
+  group by  ccst.term_code
+  order by  ccst.term_code
+
+
+"}) %>%
+  mutate(term_seq = 1:nrow(.),
+         diff_hc1 = HEADCOUNT - lag(HEADCOUNT), 
+         diff_hc3 = HEADCOUNT - lag(HEADCOUNT, 3),
+         pct_diff1 = diff_hc1 / lag(HEADCOUNT),
+         pct_diff3 = diff_hc3 / lag(HEADCOUNT, 3),
+         diff1_pct1 = pct_diff1 - lag(pct_diff1),
+         diff1_pct3 = pct_diff3 - lag(pct_diff3))
+
+  n_years <- 30
+  years <- rep(seq(2010, length.out=n_years), each=3)
+  all_terms <- data.frame(TERM_SEQUENCE=seq(from=49, length.out=n_years*3),
+                          AY=years,
+                          YEAR=c(years[-c(1:2)], rep(max(years) + 1, 2)),
+                          SEMESTER=rep(c("Fall", "Spring", "Summer"), n_years),
+                          TERM_CODE_END=rep(c("70", "80", "90"), n_years)) %>%
+    mutate(TERM_CODE = paste(AY, TERM_CODE_END, sep=""),
+           TERM = paste(SEMESTER, YEAR))
+```
+
+```{r Fix VDAY_SUMMARY errors}
+vday_bounds <- vday_sum_raw %>%
+  group_by(TERM) %>%
+  summarize(
+    min_vday = min(VDAY), 
+    max_vday = max(VDAY))
+
+term_vdays <- do.call(rbind, lapply(vday_bounds %>% pull(TERM), function(term) {
+  
+  seq(
+    from = vday_bounds %>% 
+    filter(TERM == term) %>%
+    pull(min_vday),
+    to = vday_bounds %>% 
+    filter(TERM == term) %>%
+    pull(max_vday), by=1) %>%
+    data.frame(TERM=term, vdays=.)
+    
+}))
+
+# fill in missing days
+vday_sum <- term_vdays %>%
+  left_join(vday_sum_raw, by=c("TERM", "vdays" = "VDAY")) %>%
+  mutate_at(vars(TERM_SEQUENCE:CENSUS_DATE), 
+    funs(ifelse(is.na(.), lag(.), .))) %>%
+  mutate_at(vars(DDAY, RDAY), funs(ifelse(is.na(.), lag(.) + 1, .))) %>%
+  mutate_at(vars(HEAD, SCH, SDAY), funs(ifelse(is.na(.), (lag(.) + lead(.)) / 2, .))) %>%
+  mutate_at(vars(DDAY, REG_START, START_DATE, CENSUS_DATE), funs(as.Date)) %>%
+  rename(VDAY = vdays)
+
+# check for duplicates 
+vday_sum %>%
+  group_by(TERM, VDAY) %>%
+  summarize(n_vday = n()) %>%
+  filter(n_vday > 1) # none! thank god. 
+```
+
+#### Simple VDAY, RDAY, SDAY predictions
+
+```{r Predict Day 1 Enrollment: 1-YR Lags}
+
+term_range <- vday_sum %>%
+  filter(VDAY==0) %>%
+  summarize(min = min(TERM_SEQUENCE),
+    max = max(TERM_SEQUENCE))  
+
+year_preds <- do.call(rbind, 
+  lapply((term_range %>% pull(min) + 3): (term_range %>% pull(max)), function(seq) {
+    
+    test <- terms[terms$TERM_SEQUENCE == seq, "TERM_CODE"]
+    base <- terms[terms$TERM_SEQUENCE == seq - 3, "TERM_CODE"]
+    
+    # VDAY predictions
+    vday_head <- vday_sum %>%
+      filter(TERM %in% c(base, test)) %>%
+      select(TERM, VDAY, HEAD) %>%
+      spread(key = TERM, value = HEAD) %>%
+      rename(BASE_HC = base,
+        TEST_HC = test) %>%
+      mutate(HC_DIFF_PCT    = (TEST_HC - BASE_HC) / BASE_HC,
+        HC_PRED = term_stats[term_stats$TERM == base, "HEAD_START"] +
+          (HC_DIFF_PCT * term_stats[term_stats$TERM == base, "HEAD_START"]),
+        HC_ERROR_ACT = (HC_PRED - term_stats[term_stats$TERM == test, "HEAD_START"]) /
+          term_stats[term_stats$TERM == test, "HEAD_START"],
+        HC_ERROR_PRED = (HC_PRED - term_stats[term_stats$TERM == test, "HEAD_START"]) /
+          HC_PRED) %>%
+      mutate(STAT = "VDAY") %>%
+      mutate(ALT_DAY = VDAY) %>%
+      select(STAT, VDAY, ALT_DAY, HEAD = TEST_HC, HC_PRED , 
+        HC_DIFF_PCT , HC_ERROR_ACT, HC_ERROR_PRED)
+    
+    # rday estimates
+    rday_head <- vday_sum %>%
+      filter(TERM %in% c(base, test)) %>%
+      select(TERM, RDAY, HEAD) %>%
+      spread(key = TERM, value = HEAD) %>%
+      rename(BASE_HC = base,
+        TEST_HC = test) %>%
+      mutate(HC_DIFF_PCT    = (TEST_HC - BASE_HC) / BASE_HC,
+        HC_PRED = term_stats[term_stats$TERM == base, "HEAD_START"] +
+          (HC_DIFF_PCT * term_stats[term_stats$TERM == base, "HEAD_START"]),
+        HC_ERROR_ACT = (HC_PRED - term_stats[term_stats$TERM == test, "HEAD_START"]) /
+          term_stats[term_stats$TERM == test, "HEAD_START"],
+        HC_ERROR_PRED = (HC_PRED - term_stats[term_stats$TERM == test, "HEAD_START"]) /
+          HC_PRED) %>%
+      mutate(STAT = "RDAY") %>%
+      left_join(vday_sum %>% filter(TERM == test), by="RDAY") %>%
+      select(STAT, VDAY, ALT_DAY = RDAY, HEAD = TEST_HC, HC_PRED , HC_DIFF_PCT , 
+        HC_ERROR_ACT, HC_ERROR_PRED)
+
+    # sday estimates
+    sday_head_full <- vday_sum %>%
+      filter(TERM %in% c(base, test),
+        VDAY <= 2) %>%
+      select(TERM, HEAD, VDAY) %>%
+      group_by(TERM) %>%
+      mutate(SDAY = round(1- (VDAY/(min(VDAY))), 4)) %>%
+      mutate(hc_diff_lead = lead(HEAD) - HEAD,
+        sday_lead = lead(SDAY),
+        sday_diff_lead = lead(SDAY) - SDAY ) %>%
+      filter(VDAY <= 0) %>%
+      mutate(key = "dummy key for full join") %>%
+      ungroup()
+    
+    sday_head_test <- sday_head_full %>%
+      filter(TERM == test)
+    
+    sday_head_base <- sday_head_full %>%
+      filter(TERM == base) 
+
+    sday_head <- sday_head_test %>%
+      full_join(sday_head_base, by="key", suffix=c(".test", ".base")) %>%
+      filter(SDAY.test >= SDAY.base, SDAY.test < sday_lead.base) %>%
+      mutate(hc_inter.base = HEAD.base + 
+          (hc_diff_lead.base * (SDAY.test - SDAY.base) / sday_diff_lead.base),
+        HC_DIFF_PCT = (HEAD.test - hc_inter.base) / hc_inter.base,
+        HC_PRED = term_stats[term_stats$TERM == base, "HEAD_START"] +
+          (HC_DIFF_PCT * term_stats[term_stats$TERM == base, "HEAD_START"]),
+        HC_ERROR_ACT =  (HC_PRED - term_stats[term_stats$TERM == test, "HEAD_START"])/
+          term_stats[term_stats$TERM == test, "HEAD_START"],
+        HC_ERROR_PRED =  (HC_PRED - term_stats[term_stats$TERM == test, "HEAD_START"])/
+         HC_PRED) %>%
+      ungroup() %>%
+      mutate(STAT = "SDAY") %>%
+      select(STAT, 
+        VDAY = VDAY.test,
+        ALT_DAY = SDAY.test,
+        HEAD = HEAD.test,
+        HC_PRED,
+        HC_DIFF_PCT,
+        HC_ERROR_ACT, 
+        HC_ERROR_PRED)
+    
+    # combine
+    
+    test_errs <- rbind(vday_head, sday_head, rday_head) %>% 
+      filter(!is.na(HEAD)) %>%
+      mutate(TERM = test ) 
+    
+  })) %>%
+  inner_join(terms %>% select(TERM_CODE, SEMESTER, TERM_SEQUENCE), by=c("TERM" = "TERM_CODE"))
+```
+
+#### ARMA Modelling
+
+```{r ARMA VDAY Bias Average: 4-Season}
+
+arma_v_preds <- do.call(rbind, lapply(c("Spring", "Fall", "Summer"), function(semester) {
+  
+  # loop over semesters
+  print(paste("Semester: ", semester))
+
+  # get most up-to-date data for given semester
+  
+  info_max <- vday_sum %>% 
+    filter(TERM == max(TERM)) %>%
+    filter(VDAY == max(VDAY)) %>%
+    select(TERM, VDAY)
+  
+  # VDAY of interest about which to make predictions
+  voi <- 0
+  
+  vday_stats <- do.call(rbind, lapply(c(-50:0), function(test.day) {
+    
+    # loop over vdays
+    print(paste("VDAY: ", test.day))
+    
+    # create time series including enrollment at specified VDAY
+    ts <- vday_sum %>%
+      filter(VDAY == test.day, SEMESTER %in% semester) %>%
+      mutate_at(vars(TERM_SEQUENCE), funs(. - 0.5)) %>%
+      select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH) %>%
+      rbind(vday_sum %>%
+              filter(VDAY == 0) %>% # vday 1
+              select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH)) %>%
+      arrange(TERM_SEQUENCE) %>%
+      mutate(head_diff1 = HEAD - lag(HEAD)) %>%
+      slice(-1) %>% # remove NA row due to lagged difference
+      filter(TERM != "201890") # remove current term (no VDAY 1!)
+    
+    # get max term for semester
+    
+    max_seq <- ts %>%
+      filter(SEMESTER %in% semester, VDAY == test.day) %>%
+      summarize(max(TERM_SEQUENCE)) %>%
+      pull()
+    
+    if(test.day == voi) max_seq <- max_seq - .5
+    
+    # fit model for testing
+    
+    base.ts <- ts %>% # restricted time series
+      filter(TERM_SEQUENCE <= max_seq)
+    
+    olist <- list(c(1, 1, 1), c(1, 1, 2), c(2, 1, 1), c(2, 1, 2))
+    
+    all_os <-  do.call(rbind, lapply(1:4, function(o_btw_seas) {
+      
+      do.call(rbind, lapply(1:4, function(o_win_seas) {
+        
+
+        # protect against failed ARIMA fits: return NA
+        
+        base_fit <- tryCatch(Arima(y=base.ts$head_diff1,
+                                   order=olist[[o_btw_seas]], 
+                                   seasonal = list(order=olist[[o_win_seas]], 
+                                                   period=3 + length(semester))),
+                             error=function(e) e)
+        
+        
+        if(inherits(base_fit, "error")) {
+          
+          return(data.frame(vday = test.day, o_btw = o_btw_seas, o_win = o_win_seas, 
+            term_seq=base_seq + .5, lag=NA, 
+            bias_pct_pred=NA, bias_pct_act=NA, c.bias_pct_pred=NA, c.bias_pct_act=NA)) 
+          
+        }
+        
+        # get number of terms available for prediction
+        n_terms <- ts %>%
+          filter(SEMESTER %in% semester, VDAY == test.day) %>% 
+          summarize(n()) %>% 
+          pull()
+        
+        if(test.day == voi ) n_terms <- floor(n_terms/2)
+        
+        
+        xval_out <- data.frame(dummy=FALSE, vday=test.day, 
+          o_btw = o_btw_seas, o_win = o_win_seas,
+          term_seq=NA, lag=NA, 
+          bias_pct_pred=0, bias_pct_act=0, c.bias_pct_pred=0, c.bias_pct_act=0)
+        
+        # loop through terms and get bias
+        
+        # for(lag in 0:(n_terms - ceiling(n_terms/2.5))) {
+        
+        for(lag in 0:n_terms) {  
+        
+          base_seq <- max_seq - lag * ifelse(length(semester) == 1, 3, 1)
+          
+          test.ts <- ts %>% # restricted time series
+            filter(TERM_SEQUENCE <= base_seq)
+          
+          head_base <- test.ts %>% 
+            filter(TERM_SEQUENCE == base_seq) %>%
+            select(HEAD) %>%
+            pull()
+          
+          # print(base_seq)
+          
+          head_actual <- ts %>% # actual headcount
+            filter(TERM_SEQUENCE == base_seq + .5) %>%
+            select(HEAD) %>% pull()
+          
+          if (length(head_base) == 0) next()
+          
+          fit <- tryCatch(Arima(y=test.ts$head_diff1, model = base_fit),
+                          error=function(e) e)
+          
+          if(inherits(fit, "error")) if(inherits(fit, "error")) next()
+
+          prior_error <- xval_out %>% 
+            summarize(bias_mean = mean(bias_pct_pred, na.rm=TRUE)) %>% pull()
+          
+          pred <- predict(fit, n.ahead=1)$pred[1] + head_base 
+          bias_pct_pred <- (pred - head_actual) / pred
+          bias_pct_act <- (pred - head_actual) / head_actual
+          
+          c.pred <- pred - (prior_error * pred)
+          c.bias_pct_pred <- (c.pred - head_actual) /c.pred
+          c.bias_pct_act <- (c.pred - head_actual) / head_actual
+            
+          
+          xval_out[lag + 1, ] <- c(dummy=TRUE, 
+            vday=test.day, o_btw = o_btw_seas, o_win = o_win_seas, 
+            term_seq=base_seq + 0.5, lag=lag,
+            bias_pct_pred, bias_pct_act, c.bias_pct_pred, c.bias_pct_act)
+   
+          if(nrow(xval_out) > 1) xval_out <- xval_out %>% filter(dummy==TRUE)
+          
+        }
+        
+        xval_out %>% select(-dummy)
+        
+        
+      }))
+       
+      
+    })) %>% filter(!is.na(bias_pct_pred))
+    
+    # get average and sd of error for all parameter combinations 
+    
+    o_stats <- all_os %>%
+      group_by(o_btw, o_win) %>%
+      summarize(bias_mean = mean(bias_pct_pred, na.rm=TRUE), 
+        c.bias_mean=mean(c.bias_pct_pred, na.rm=TRUE), 
+        bias_sd = sd(bias_pct_act, na.rm=TRUE),
+        c.bias_sd = sd(c.bias_pct_act, na.rm=TRUE),
+        n_terms = n(),
+        min_term = min(term_seq)) %>%
+      ungroup() %>%
+      filter(bias_sd == min(bias_sd, na.rm=TRUE)) %>% 
+      mutate(VDAY = test.day)
+    
+    o_stats
+    
+  }))         
+  
+  
+  cbind(semester=semester, vday_stats) %>%
+    select(semester, VDAY, n_terms, min_term, o_btw:c.bias_sd)
+  
+}))
+
+```
+
+
+```{r ARMA VDAY Bias Average: 3-Season}
+
+   # VDAY of interest about which to make predictions
+  voi <- 0
+  
+  info_max <- vday_sum %>% 
+    filter(VDAY == 0) %>%
+    filter(TERM == max(TERM)) %>%
+    select(TERM, VDAY)
+  
+
+    # create time series including enrollment at specified VDAY
+    ts <- vday_sum %>%
+      filter(VDAY == 0) %>%
+      select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH) %>%
+      arrange(TERM_SEQUENCE) %>%
+      mutate(head_diff1 = HEAD - lag(HEAD)) %>%
+      slice(-1)
+    
+    # fit model for testing
+    
+
+    olist <- list(c(1, 1, 1), c(1, 1, 2), c(2, 1, 1), c(2, 1, 2), c(3, 1, 3))
+    ogrid <- expand.grid(c(1, 2, 3), 1, c(1, 2, 3))
+    
+    all_os <-  do.call(rbind, lapply(1:nrow(ogrid), function(o_btw_seas) {
+      
+      do.call(rbind, lapply(1:nrow(ogrid), function(o_win_seas) {
+        
+        base.ts <- ts
+        max_seq <- ts %>% summarize(max(TERM_SEQUENCE)) %>% pull()
+        # protect against failed ARIMA fits: return NA
+        
+        base_fit <- tryCatch(Arima(y=base.ts$head_diff1,
+                                   order=ogrid %>% slice(o_btw_seas) %>% unlist(), 
+                                   seasonal = list(order=ogrid %>% slice(o_win_seas) %>% unlist(), 
+                                                   period=3)),
+                             error=function(e) e)
+        
+        
+        if(inherits(base_fit, "error")) {
+          
+          return(data.frame(o_btw = o_btw_seas, o_win = o_win_seas, 
+            term_seq=base_seq, lag=NA, 
+            bias_pct_pred=NA, bias_pct_act=NA, c.bias_pct_pred=NA, c.bias_pct_act=NA)) 
+          
+        }
+        
+        # get number of terms available for prediction
+        n_terms <- ts %>%
+          summarize(n()) %>% 
+          pull()
+        
+        xval_out <- data.frame(dummy=FALSE, 
+          o_btw = o_btw_seas, o_win = o_win_seas,
+          term_seq=NA, lag=NA, 
+          bias_pct_pred=0, bias_pct_act=0, c.bias_pct_pred=0, c.bias_pct_act=0)
+        
+        # loop through terms and get bias
+        
+        for(lag in 0:n_terms) {  
+        
+          base_seq <- max_seq - lag - 1
+          
+          test.ts <- ts %>% # restricted time series
+            filter(TERM_SEQUENCE <= base_seq)
+          
+          head_base <- test.ts %>% 
+            filter(TERM_SEQUENCE == base_seq) %>%
+            select(HEAD) %>%
+            pull()
+          
+          # print(base_seq)
+          
+          head_actual <- ts %>% # actual headcount
+            filter(TERM_SEQUENCE == base_seq + 1) %>%
+            select(HEAD) %>% pull()
+          
+          if (length(head_base) == 0) next()
+          
+          fit <- tryCatch(Arima(y=test.ts$head_diff1, model = base_fit),
+                          error=function(e) e)
+          
+          if(inherits(fit, "error")) if(inherits(fit, "error")) next()
+
+          prior_error <- xval_out %>% 
+            summarize(bias_mean = mean(bias_pct_pred, na.rm=TRUE)) %>% pull()
+          
+          pred <- predict(fit, n.ahead=1)$pred[1] + head_base 
+          bias_pct_pred <- (pred - head_actual) / pred
+          bias_pct_act <- (pred - head_actual) / head_actual
+          
+          c.pred <- pred - (prior_error * pred)
+          c.bias_pct_pred <- (c.pred - head_actual) /c.pred
+          c.bias_pct_act <- (c.pred - head_actual) / head_actual
+            
+          
+          xval_out[lag + 1, ] <- c(dummy=TRUE, 
+            o_btw = o_btw_seas, o_win = o_win_seas, 
+            term_seq=base_seq + 1, lag=lag,
+            bias_pct_pred, bias_pct_act, c.bias_pct_pred, c.bias_pct_act)
+   
+          if(nrow(xval_out) > 1) xval_out <- xval_out %>% filter(dummy==TRUE)
+          
+        }
+        
+        xval_out %>% select(-dummy)
+        
+        
+      }))
+       
+      
+    })) %>% filter(!is.na(bias_pct_pred))
+    
+    # get average and sd of error for all parameter combinations 
+    
+    o_stats <- all_os %>%
+      group_by(o_btw, o_win) %>%
+      summarize(bias_mean = mean(bias_pct_pred, na.rm=TRUE), 
+        c.bias_mean=mean(c.bias_pct_pred, na.rm=TRUE), 
+        bias_sd = sd(bias_pct_act, na.rm=TRUE),
+        c.bias_sd = sd(c.bias_pct_act, na.rm=TRUE),
+        n_terms = n(),
+        min_term = min(term_seq)) %>%
+      ungroup() %>%
+      filter(bias_sd == min(bias_sd, na.rm=TRUE)) 
+   
+    fit.out <- Arima(y=base.ts$head_diff1,
+                     order=ogrid %>% slice(o_stats %>% pull(o_btw)) %>% unlist(), 
+                     seasonal = list(order=ogrid %>% slice(o_stats %>% pull(o_win)) %>% unlist(), 
+                           period=3))
+    cumsum(predict(fit.out, n.ahead = 4)$pred) + ts %>% filter(TERM_SEQUENCE ==  max(TERM_SEQUENCE)) %>% pull(HEAD)
+```
+
+```{r Combine Estiamtes For Evaluation}
+
+# get terms for comparison
+
+all_stat_error <- year_preds %>%
+  inner_join(arma_v_preds, by=c("SEMESTER" = "semester", "VDAY")) %>%
+  filter(TERM_SEQUENCE >= min_term) %>%
+  select(STAT:TERM_SEQUENCE) %>%
+  group_by(SEMESTER, VDAY, STAT) %>%
+  summarize(n_terms = n(), 
+    bias_mean = mean(HC_ERROR_PRED, na.rm=TRUE), 
+    bias_sd = sd(HC_ERROR_ACT, na.rm=TRUE)) %>%
+  ungroup() %>%
+  rbind(arma_v_preds %>%
+      mutate(STAT="ARMA_V") %>%
+      select(SEMESTER=semester, VDAY, STAT, n_terms, bias_mean, bias_sd)) %>%
+    # rbind(arma_s_preds %>%
+    #   mutate(STAT="ARMA_S") %>%
+    #   select(SEMESTER=semester, VDAY, STAT, n_terms, bias_mean, bias_sd)) %>%
+  gather(key = "sum_stat", value="estimate", bias_mean, bias_sd)
+
+all_stat_error %>% 
+  filter(VDAY > -30 & VDAY < 0, !STAT %in% c("RDAY")) %>%
+  ggplot() + 
+    geom_line(aes(x=VDAY, y=estimate, color=STAT), lwd=1) +
+    geom_hline(yintercept = 0, lty=2)+
+    facet_wrap(vars(SEMESTER, sum_stat), scale="free") 
+
+```
+
+```{r Enrollment Prediction Function NEW}
+
+pred_enrl <- function(n_ahead=4, # number of terms ahead to predict
+                      vday=0, # day of term at which to make predictions
+                      server=NULL, # required: "PRGM", "PROD", or "PPRD"
+                      JDBC.path=NULL, # path to jdbc jar file; file.choose if NULL
+                      w.vday.only=FALSE,  # switch to exclude most recent info
+                      stat="H",
+                      min_stat="aic") {
+
+  require(dplyr) # data manipulation
+  require(forecast) # Arima functions
+  require(getPass) # password masking 
+  require(DBI) # database connectivity functions
+  require(RJDBC) # JDBC Driver
+  
+    ##### Connect to Banner #####
+  
+  drv <- if(is.null(JDBC.path)) {
+    
+    print("Choose JDBC JAR File")
+    
+    JDBC(driverClass="oracle.jdbc.driver.OracleDriver", # Oracle thin driver name
+         classPath = choose.files() ) # path to JDBC driver 
+  } else {
+    
+    JDBC(driverClass="oracle.jdbc.driver.OracleDriver", # Oracle thin driver name
+         classPath = JDBC.path ) # path to JDBC driver 
+  }
+  
+  # make connection to Oracle database, given server name
+  
+  server.uri = switch(tolower(server), 
+                      "prgm" = "jdbc:oracle:thin:@//oradev.admin.ad.cnm.edu/prgm.admin.ad.cnm.edu",
+                      "prod" = "jdbc:oracle:thin:@//prod.admin.ad.cnm.edu/prod.admin.ad.cnm.edu",
+                      "pprd" = "jdbc:oracle:thin:@//oradev.admin.ad.cnm.edu/pprd.admin.ad.cnm.edu")
+  
+  conn <- dbConnect(drv, 
+                    url=server.uri, # from ITS 
+                    user=getPass(msg="username: "), password=getPass()) # credentials
+  
+  ##### Get Banner Information #####
+  
+  # get information about terms
+  terms <- dbGetQuery(conn = conn, statement = {
+    
+    "
+        SELECT  DISTINCT
+                terms.TERM_CODE
+              , terms.TERM_SEQUENCE
+              , terms.SEMESTER
+              , rsts.SFRRSTS_START_DATE AS REG_START
+              , terms.START_DATE
+              , terms.CENSUS            AS CENSUS_DATE
+        FROM    CHELINK.TERMS_AND_SEMESTERS terms
+        JOIN    CHELINK.VDAY_SUMMARY vday
+           ON   terms.TERM_CODE = vday.TERM_CODE
+        JOIN    SATURN.SFRRSTS rsts
+            ON  terms.TERM_CODE = rsts.SFRRSTS_TERM_CODE
+          AND   rsts.SFRRSTS_PTRM_CODE IN ('1', '300')  
+          AND   rsts.SFRRSTS_RSTS_CODE = 'RW'
+        ORDER BY TERM_SEQUENCE
+      "
+    
+  }) %>% 
+    mutate_at(vars(SEMESTER), 
+              funs(recode(., "F" = "Fall", "S" = "Spring", "R" = "Summer")))
+  
+  # get vday summary information (headcount, sch)
+  vday_sum_raw <- dbGetQuery(conn = conn, statement = {
+    
+    "
+        SELECT   vday.TERM_CODE   term
+            ,   vday.DDAY        
+            ,   vday.VDAY        
+            ,   vday.RDAY        
+            ,   vday.HEADCOUNT   AS head
+            ,   vday.SCH_COUNT   AS sch
+        FROM     CHELINK.VDAY_SUMMARY vday
+      "
+    
+  }) %>%
+    full_join(terms, by=c("TERM" = "TERM_CODE")) %>%
+    mutate_at(vars(DDAY, REG_START, START_DATE, CENSUS_DATE), funs(base::as.Date(.))) %>%
+    filter(DDAY >= REG_START, DDAY <= CENSUS_DATE) %>%
+    mutate_at(vars(VDAY), funs(ifelse(. >= 1, .-1, .))) %>% # VDAY 1 => VDAY 0
+    mutate_at(vars(TERM_SEQUENCE), funs(as.numeric(.))) %>%
+    group_by(TERM) %>%
+    mutate(SDAY = round(1- (VDAY / (min(VDAY))), 4)) %>% # calculate SDAY
+    ungroup() %>%
+    arrange(TERM, DDAY)
+  
+  ##### Fix VDAY_SUMMARY Errors #####
+  
+  vday_bounds <- vday_sum_raw %>%
+    group_by(TERM) %>%
+    summarize(
+      min_vday = min(VDAY), 
+      max_vday = max(VDAY))
+  
+  term_vdays <- do.call(rbind, lapply(vday_bounds %>% pull(TERM), function(term) {
+    
+    seq(
+      from = vday_bounds %>% 
+        filter(TERM == term) %>%
+        pull(min_vday),
+      to = vday_bounds %>% 
+        filter(TERM == term) %>%
+        pull(max_vday), by=1) %>%
+      data.frame(TERM=term, vdays=.)
+    
+  })) %>% 
+    mutate_at(vars(TERM), funs(as.character(.)))
+  
+  # fill in missing days with linear interpolation
+  vday_sum <- term_vdays %>%
+    left_join(vday_sum_raw, by=c("TERM", "vdays" = "VDAY")) %>%
+    mutate_at(vars(TERM_SEQUENCE:CENSUS_DATE), 
+              funs(ifelse(is.na(.), lag(.), .))) %>%
+    mutate_at(vars(DDAY, RDAY), funs(ifelse(is.na(.), lag(.) + 1, .))) %>%
+    mutate_at(vars(HEAD, SCH, SDAY), funs(ifelse(is.na(.), (lag(.) + lead(.)) / 2, .))) %>%
+    mutate_at(vars(DDAY, REG_START, START_DATE, CENSUS_DATE), funs(as.Date)) %>%
+    rename(VDAY = vdays)
+  
+  if(stat=="SCH") {
+    vday_sum <- vday_sum %>%
+    select(-HEAD) %>%
+    rename(HEAD=SCH) }
+  
+  # check for duplicates 
+  dups <- vday_sum %>%
+    group_by(TERM, VDAY) %>%
+    summarize(n_vday = n()) %>%
+    filter(n_vday > 1)
+  
+  if(nrow(dups) > 0) stop("Duplicate VDAY entries exist. Fix them first!")
+  
+  ##### Get Base Information ####
+  
+  voi=vday
+  period <- ifelse(w.vday.only, 3, 4)
+  term_lag <- ifelse(w.vday.only, 0, .5)
+  
+  # build basic information for all past / future terms
+  n_years <- 30
+  years <- rep(seq(2010, length.out=n_years), each=3)
+  all_terms <- data.frame(TERM_SEQUENCE=seq(from=49, length.out=n_years*3),
+                          AY=years,
+                          YEAR=c(years[-c(1:2)], rep(max(years) + 1, 2)),
+                          SEMESTER=rep(c("Fall", "Spring", "Summer"), n_years),
+                          TERM_CODE_END=rep(c("70", "80", "90"), n_years)) %>%
+    mutate(TERM_CODE = paste(AY, TERM_CODE_END, sep=""),
+           TERM = paste(SEMESTER, YEAR))
+  
+  # get most up-to-date enrollment information 
+  
+  if(w.vday.only) vday_sum <- vday_sum %>% filter(VDAY == vday)
+  
+  info_max <- vday_sum %>% 
+    filter(TERM == max(TERM)) %>%
+    filter(VDAY == max(VDAY)) %>%
+    select(TERM, VDAY, SEMESTER, TERM_SEQUENCE, HEAD) %>%
+    mutate_at(vars(TERM_SEQUENCE), funs(ifelse(VDAY < 0, . - term_lag, 
+                                               ifelse(VDAY > 0, . + term_lag, .))))
+  
+  # most advanced term with complete enrollment data given VDAY of interest
+  max_w_vday <- vday_sum %>%
+    filter(VDAY == voi) %>%
+    filter(TERM == max(TERM)) %>%
+    select(TERM, TERM_SEQUENCE, SEMESTER)
+  
+  # vday with most up-to-date enrollment information  
+  test.day <- info_max %>% pull(VDAY)
+  
+  # create time series concatenating VDAY of interested (VOI) and test.day
+  ts <- if(w.vday.only) {
+    
+    vday_sum %>%
+      filter(VDAY == vday) %>% # vday of interest defined by user
+      select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD) %>%
+      arrange(TERM_SEQUENCE) %>%
+      mutate(head_diff1 = HEAD - lag(HEAD)) %>%
+      slice(-1) %>% # remove NA row due to lagged differencing
+      filter(TERM <= max_w_vday %>% pull(TERM))
+    
+  } else {
+    
+  vday_sum %>%
+    filter(VDAY == test.day, SEMESTER == info_max %>% pull(SEMESTER)) %>%
+    mutate_at(vars(TERM_SEQUENCE), funs(. - 0.5)) %>% # for ordering of series
+    select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD) %>%
+    rbind(vday_sum %>%
+            filter(VDAY == vday) %>% # vday of interest defined by user
+            select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD)) %>%
+    arrange(TERM_SEQUENCE) %>%
+    mutate(head_diff1 = HEAD - lag(HEAD)) %>%
+    slice(-1) %>% # remove NA row due to lagged differencing
+    filter(TERM <= max_w_vday %>% pull(TERM)) # terms with VOI only
+  
+  } 
+  ##### Get Best Models For Desired Predictions #####
+  
+  best_mods <- do.call(rbind,lapply(1:n_ahead, function(n_ahead) {
+    
+    print(n_ahead)
+    base.ts <- ts
+    # cut out intermediate times from predictions, if n_ahead > 3
+
+      
+      which_pred <- n_ahead
+      
+      if((!w.vday.only) & which_pred / 4 >= 1) which_pred=which_pred + which_pred %/% 4
+      
+      # get base time series allowing prediction past 3 terms, depending on n_ahead
+      
+      i=0
+      while(i < which_pred | 
+            base.ts %>% slice(nrow(.)) %>% pull(VDAY) != test.day | 
+            base.ts %>% slice(nrow(.)) %>% pull(SEMESTER) != info_max %>% pull(SEMESTER)) {
+        
+        base.ts <- base.ts %>%
+          slice(-nrow(.))
+        i <- i + 1
+        
+      }
+    
+    # list of order parameters to loop over (AR, Diff, MA)
+    ogrid <- expand.grid(c(1, 2, 3), 1, c(1, 2, 3))
+    
+    all_os <-  do.call(rbind, lapply(1:nrow(ogrid), function(o_btw_seas) {
+      
+      do.call(rbind, lapply(1:nrow(ogrid), function(o_win_seas) {
+        
+        print(paste(o_btw_seas, o_win_seas))
+        # fit base model; protect against failed ARMA fits: return NA
+        base_fit <- tryCatch(Arima(y=base.ts$head_diff1,
+                                   order= ogrid %>% slice(o_btw_seas) %>% unlist(), 
+                                   seasonal = list(order=ogrid %>% slice(o_win_seas) %>% unlist(), 
+                                                   period=period)),
+                             error=function(e) e)
+        
+        
+        if(inherits(base_fit, "error")) {
+          
+          return(data.frame(dummy=TRUE, vday = test.day, o_btw = o_btw_seas, o_win = o_win_seas, 
+                           b.aic=NA, aic=NA, term_seq= NA, lag=NA, 
+                            bias_pct_pred=NA, bias_pct_act=NA, c.bias_pct_pred=NA, c.bias_pct_act=NA)) 
+          
+        }
+        
+        # get number of terms available for prediction
+        n_terms <- base.ts %>%
+          filter(SEMESTER == info_max %>% pull(SEMESTER), VDAY == test.day) %>% 
+          summarize(n()) %>% 
+          pull()
+        
+        if(test.day == voi ) n_terms <- floor(n_terms/2)
+        
+        
+        xval_out <- data.frame(dummy=FALSE, vday=test.day, 
+                               o_btw = o_btw_seas, o_win = o_win_seas,
+                               b.aic=NA, aic=NA, term_seq=NA, lag=NA, 
+                               bias_pct_pred=0, bias_pct_act=0, c.bias_pct_pred=0, c.bias_pct_act=0)
+        
+        #loop through terms and get bias
+        # for(lag in 0:(n_terms - ceiling(n_terms/2.5))) {
+          
+        for(lag in 0:n_terms) {
+          
+          
+          base_seq <- base.ts %>% summarize(max(TERM_SEQUENCE)) %>% pull() - lag * 3
+          
+          test.ts <- base.ts
+          
+          head_base <- test.ts %>% 
+            filter(TERM_SEQUENCE == base_seq) %>%
+            select(HEAD) %>%
+            pull()
+          
+          # get actual headcount for term to be predicted
+          head_actual <- ts %>% # actual headcount
+            filter(TERM_SEQUENCE == base_seq + n_ahead - term_lag) %>%
+            select(HEAD) %>% pull()
+          
+          if (length(head_base) == 0) next()
+          
+          fit <- tryCatch(Arima(y=test.ts$head_diff1, model = base_fit),
+                          error=function(e) e)
+          
+          if(inherits(fit, "error")) if(inherits(fit, "error")) next()
+          
+          prior_error <- xval_out %>% 
+            summarize(bias_mean = mean(bias_pct_pred, na.rm=TRUE)) %>% pull()
+          
+          preds <- cumsum(predict(fit, n.ahead=which_pred)$pred) + head_base
+          pred <- preds[which_pred]
+          bias_pct_pred <- (pred - head_actual) / pred
+          bias_pct_act <- (pred - head_actual) / head_actual
+          
+          c.pred <- pred - (prior_error * pred)
+          c.bias_pct_pred <- (c.pred - head_actual) /c.pred
+          c.bias_pct_act <- (c.pred - head_actual) / head_actual
+          
+          xval_out[lag + 1, ] <- c(dummy=TRUE, 
+                                   vday=test.day, o_btw = o_btw_seas, o_win = o_win_seas, 
+                                   b.aic=base_fit$aicc, aic=fit$aicc, term_seq=base_seq + n_ahead - term_lag, lag=lag,
+                                   bias_pct_pred, bias_pct_act, c.bias_pct_pred, c.bias_pct_act)
+          
+          if(nrow(xval_out) > 1) xval_out <- xval_out %>% filter(dummy==TRUE)
+          
+        }
+        
+        xval_out 
+        
+      }))
+      
+    })) %>% filter(!is.na(bias_pct_pred)) %>%
+      select(-dummy)# end of all_os
+    
+    # get average and sd of error for all parameter combinations 
+    o_stats_raw <- all_os %>%
+      group_by(o_btw, o_win) %>%
+      summarize(aic = max(aic), 
+                bias_mean = mean(bias_pct_pred, na.rm=TRUE), 
+                c.bias_mean=mean(c.bias_pct_pred, na.rm=TRUE), 
+                bias_sd = sd(bias_pct_act, na.rm=TRUE),
+                c.bias_sd = sd(c.bias_pct_act, na.rm=TRUE),
+                n_terms = n(),
+                min_term = min(term_seq)) %>%
+      ungroup() 
+    
+    o_stats_raw <- if(tolower(min_stat) == "aic") {
+      o_stats_raw %>% 
+        filter(aic == min(aic, na.rm=TRUE))
+    } else {
+      o_stats_raw %>%
+        filter(bias_sd == min(bias_sd, na.rm=TRUE))}
+    
+    o_stats <- o_stats_raw %>% 
+      mutate(VDAY = test.day, n_ahead= n_ahead, 
+        predict.with=base.ts %>% summarize(max(TERM)) %>% pull(), 
+        predict.with.seq=base.ts %>% summarize(max(TERM_SEQUENCE)) %>% pull(),
+        term.predicted=all_terms %>% 
+          filter(TERM_SEQUENCE == info_max %>% 
+              pull(TERM_SEQUENCE) + n_ahead - term_lag) %>%
+          pull(TERM),
+        term.predicted.seq = all_terms %>% 
+          filter(TERM_SEQUENCE == info_max %>% 
+              pull(TERM_SEQUENCE) + n_ahead - term_lag) %>%
+          pull(TERM_SEQUENCE),
+        semester.predicted = all_terms %>% 
+          filter(TERM_SEQUENCE == info_max %>% 
+              pull(TERM_SEQUENCE) + n_ahead - term_lag) %>%
+          pull(SEMESTER)) 
+    
+  }))  # end of best_mods functions
+  
+  ##### Forcast Enrollment #####
+  
+  # create time series for current predictions
+
+  ts.pred <- if(w.vday.only) {
+    
+    vday_sum %>%
+      filter(VDAY == info_max %>% pull(VDAY)) %>% 
+      select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD) %>%
+      arrange(TERM_SEQUENCE) %>%
+      mutate(head_diff1 = HEAD - lag(HEAD)) %>%
+      slice(-1) %>% mutate_at(vars(SEMESTER), funs(as.factor(.)))
+    
+  } else {
+    
+    vday_sum %>%
+      filter(VDAY == info_max %>% pull(VDAY), SEMESTER == info_max %>% pull(SEMESTER)) %>%
+      mutate_at(vars(TERM_SEQUENCE), funs(. - term_lag)) %>%
+      select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD) %>%
+      rbind(vday_sum %>%
+              filter(VDAY == vday) %>% # vday of interest
+              select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD)) %>%
+      arrange(TERM_SEQUENCE) %>%
+      mutate(head_diff1 = HEAD - lag(HEAD)) %>%
+      slice(-1) %>%
+      mutate_at(vars(SEMESTER), funs(as.factor(.)))
+    
+  } 
+  
+  # loop through terms-to-predict and use best models 
+  preds_list <- do.call(rbind, lapply(1:n_ahead, function(pred_term) {
+    
+    # cut out intermediate times if n_ahead > 3 
+    which_pred <- pred_term
+    if((!w.vday.only) & which_pred / 4 >= 1) which_pred=which_pred + which_pred %/% 4
+    
+    # get optimal order parameters
+    o_btw <- best_mods %>%
+      filter(n_ahead == pred_term) %>%
+      pull(o_btw)
+    
+    o_win <- best_mods %>%
+      filter(n_ahead ==pred_term) %>%
+      pull(o_win)
+    
+     ogrid <- expand.grid(c(1, 2, 3), 1, c(1, 2, 3))
+    # refit model
+    newfit <- Arima(y=ts.pred$head_diff1, 
+                    order=ogrid %>% slice(o_btw) %>% unlist(), 
+                    seasonal=list(order=ogrid %>% slice(o_win) %>% unlist(), period=4))
+    
+    # get predictions
+    newpred <- cumsum(predict(newfit, n.ahead = which_pred)$pred) + 
+      info_max %>% pull(HEAD)
+    
+    # get prediction 
+    pred_out <- best_mods %>%
+      filter(n_ahead == pred_term) %>%
+      mutate(hc_pred = round(newpred[which_pred])) %>%
+      left_join(ts.pred %>% filter(VDAY == voi) %>%
+                  group_by(SEMESTER) %>%
+                  filter(TERM_SEQUENCE == max(TERM_SEQUENCE)) %>%
+                  select(hc_past=HEAD, SEMESTER), by=c("semester.predicted" = "SEMESTER")) %>%
+      mutate(c.hc_pred = floor(hc_pred - c.bias_mean * hc_pred), 
+             c.hc_pred_pct = (c.hc_pred - hc_past)/hc_past,
+             p.975 = qt(.975, n_terms-1) * bias_sd / sqrt(n_terms),
+             upper = c.hc_pred_pct + p.975, 
+             lower = c.hc_pred_pct - p.975)
+    
+    return(pred_out)
+    
+  }))
+  
+  return(preds_list)
+  
+}
+
+
+preds <- pred_enrl(n_ahead = 4, vday=0, stat="HEAD", min_stat="PRED", server="prgm", 
+                   JDBC.path = "C:/Users/tfarkas/Oracle/ojdbc6.jar")
+
+preds.aic <- pred_enrl(n_ahead = 4, vday=0, stat="HEAD", min_stat="aic", server="prgm", 
+                   JDBC.path = "C:/Users/tfarkas/Oracle/ojdbc6.jar")
+```
+##### OLD CODE
+
+```{r ARMA SDAY Bias Average}
+
+arma_s_preds <- do.call(rbind, lapply(c("Spring", "Fall", "Summer"), function(semester) {
+  
+  # loop over semesters
+  print(paste("Semester: ", semester))
+
+  # get most up-to-date data for given semester
+  
+  info_max <- vday_sum %>% 
+    filter(TERM == max(TERM)) %>%
+    filter(VDAY == max(VDAY)) %>%
+    select(TERM, VDAY)
+  
+  # VDAY of interest about which to make predictions
+  voi <- 0
+  
+  vday_stats <- do.call(rbind, lapply(c(-50:0), function(test.day) {
+    
+    # loop over vdays
+    print(paste("VDAY: ", test.day))
+    
+    predict.with <- vday_sum %>% 
+      filter(VDAY == test.day,
+        SEMESTER==semester) %>%
+      summarize(TERM=max(TERM), 
+        TERM_SEQUENCE=max(TERM_SEQUENCE), 
+        N_TERMS = n())
+
+      
+    tday_terms <- do.call(rbind, lapply(1:(predict.with %>% pull(N_TERMS) -1), function(lag) {
+      
+      
+      test.seq <- predict.with %>% pull(TERM_SEQUENCE)
+      base.seq <- predict.with %>% pull(TERM_SEQUENCE) - 3 * lag
+      
+      test <- terms %>%
+        filter(TERM_SEQUENCE==test.seq) %>%
+        pull(TERM_CODE)
+      
+      base <- terms %>%
+        filter(TERM_SEQUENCE==base.seq) %>%
+        pull(TERM_CODE)
+      
+      sday_head_full <- vday_sum %>%
+        filter(TERM %in% c(base, test),
+          VDAY <= 2) %>%
+        select(TERM, TERM_SEQUENCE, SEMESTER, HEAD, VDAY) %>%
+        group_by(TERM) %>%
+        mutate(SDAY = round(1- (VDAY/(min(VDAY))), 4)) %>%
+        mutate(hc_diff_lead = lead(HEAD) - HEAD,
+          sday_lead = lead(SDAY),
+          sday_diff_lead = lead(SDAY) - SDAY ) %>%
+        filter(VDAY <= 0) %>%
+        mutate(key = "dummy key for full join") %>%
+        ungroup()
+      
+      sday_head_test <- sday_head_full %>%
+        filter(TERM == test)
+      
+      sday_head_base <- sday_head_full %>%
+        filter(TERM == base) 
+      
+      sday_head <- sday_head_test %>%
+        full_join(sday_head_base, by="key", suffix=c(".test", ".base")) %>%
+        filter(SDAY.test >= SDAY.base, SDAY.test < sday_lead.base) %>%
+        mutate(hc_inter.base = round(HEAD.base + 
+            (hc_diff_lead.base * (SDAY.test - SDAY.base) / sday_diff_lead.base))) %>%
+        select(TERM=TERM.base, TERM_SEQUENCE=TERM_SEQUENCE.base, SEMESTER = SEMESTER.test,
+          VDAY=VDAY.test, SDAY=SDAY.test,
+          HEAD=hc_inter.base) %>%
+        filter(VDAY==test.day)
+      
+      
+      
+    }))
+    
+    # create time series including enrollment at specified VDAY
+    ts <- tday_terms %>%
+      mutate_at(vars(TERM_SEQUENCE), funs(. - 0.5)) %>%
+      rbind(vday_sum %>%
+              filter(VDAY == voi) %>% # vday 1
+              select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, SDAY, HEAD)) %>%
+      arrange(TERM_SEQUENCE) %>%
+      mutate(head_diff1 = HEAD - lag(HEAD)) %>%
+      slice(-1) %>% # remove NA row due to lagged difference
+      filter(TERM != "201890") # remove current term (no VDAY 1!)
+    
+    # get max term for semester
+    
+    max_seq <- ts %>%
+      filter(SEMESTER %in% semester, VDAY == test.day) %>%
+      summarize(max(TERM_SEQUENCE)) %>%
+      pull()
+    
+    if(test.day == voi) max_seq <- max_seq - .5
+    
+    # fit model for testing
+    
+    base.ts <- ts %>% # restricted time series
+      filter(TERM_SEQUENCE <= max_seq)
+    
+    olist <- list(c(1, 1, 1), c(1, 1, 2), c(2, 1, 1), c(2, 1, 2))
+    
+    all_os <-  do.call(rbind, lapply(1:4, function(o_btw_seas) {
+      
+      do.call(rbind, lapply(1:4, function(o_win_seas) {
+        
+        # print("START BASE FIT")
+        # 
+        # print(paste("btw: ", o_btw_seas))
+        # print(paste("win: ", o_win_seas))
+        
+        # protect against failed ARIMA fits: return NA
+        
+        base_fit <- tryCatch(Arima(y=base.ts$head_diff1,
+                                   order=olist[[o_btw_seas]], 
+                                   seasonal = list(order=olist[[o_win_seas]], 
+                                                   period=3 + length(semester))),
+                             error=function(e) e)
+        
+        
+        if(inherits(base_fit, "error")) {
+          
+          return(data.frame(vday = test.day, o_btw = o_btw_seas, o_win = o_win_seas, 
+            term_seq=base_seq + .5, lag=NA, 
+            bias_pct_pred=NA, bias_pct_act=NA, c.bias_pct_pred=NA, c.bias_pct_act=NA)) 
+          
+        }
+        
+        # print("BASE FIT COMPLETE")
+        
+        # get number of terms available for prediction
+        n_terms <- ts %>%
+          filter(SEMESTER %in% semester, VDAY == test.day) %>% 
+          summarize(n()) %>% 
+          pull()
+        
+        if(test.day == voi ) n_terms <- floor(n_terms/2)
+        
+        
+        xval_out <- data.frame(dummy=FALSE, vday=test.day, 
+          o_btw = o_btw_seas, o_win = o_win_seas,
+          term_seq=NA, lag=NA, 
+          bias_pct_pred=0, bias_pct_act=0, c.bias_pct_pred=0, c.bias_pct_act=0)
+        
+        # loop through terms and get bias
+        
+        for(lag in 0:(n_terms - ceiling(n_terms/2.5))) {
+          
+          base_seq <- max_seq - lag * ifelse(length(semester) == 1, 3, 1)
+          
+          test.ts <- ts %>% # restricted time series
+            filter(TERM_SEQUENCE <= base_seq)
+          
+          head_base <- test.ts %>% 
+            filter(TERM_SEQUENCE == base_seq) %>%
+            select(HEAD) %>%
+            pull()
+          
+          # print(base_seq)
+          
+          head_actual <- ts %>% # actual headcount
+            filter(TERM_SEQUENCE == base_seq + .5) %>%
+            select(HEAD) %>% pull()
+          
+          if (length(head_base) == 0) next()
+          
+          fit <- tryCatch(Arima(y=test.ts$head_diff1, model = base_fit),
+                          error=function(e) e)
+          
+          if(inherits(fit, "error")) if(inherits(fit, "error")) next()
+
+          prior_error <- xval_out %>% 
+            summarize(bias_mean = mean(bias_pct_pred, na.rm=TRUE)) %>% pull()
+          
+          pred <- predict(fit, n.ahead=1)$pred[1] + head_base 
+          bias_pct_pred <- (pred - head_actual) / pred
+          bias_pct_act <- (pred - head_actual) / head_actual
+          
+          c.pred <- pred - (prior_error * pred)
+          c.bias_pct_pred <- (c.pred - head_actual) /c.pred
+          c.bias_pct_act <- (c.pred - head_actual) / head_actual
+            
+          
+          xval_out[lag + 1, ] <- c(dummy=TRUE, 
+            vday=test.day, o_btw = o_btw_seas, o_win = o_win_seas, 
+            term_seq=base_seq + 0.5, lag=lag,
+            bias_pct_pred, bias_pct_act, c.bias_pct_pred, c.bias_pct_act)
+   
+          if(nrow(xval_out) > 1) xval_out <- xval_out %>% filter(dummy==TRUE)
+          
+        }
+        
+        xval_out %>% select(-dummy)
+        
+        
+      }))
+       
+      
+    })) %>% filter(!is.na(bias_pct_pred))
+    
+    # get average and sd of error for all parameter combinations 
+    
+    o_stats <- all_os %>%
+      group_by(o_btw, o_win) %>%
+      summarize(bias_mean = mean(bias_pct_pred, na.rm=TRUE), 
+        c.bias_mean=mean(c.bias_pct_pred, na.rm=TRUE), 
+        bias_sd = sd(bias_pct_act, na.rm=TRUE),
+        c.bias_sd = sd(c.bias_pct_act, na.rm=TRUE),
+        n_terms = n(),
+        min_term = min(term_seq)) %>%
+      ungroup() %>%
+      filter(bias_sd == min(bias_sd, na.rm=TRUE)) %>% 
+      mutate(VDAY = test.day)
+    
+    o_stats
+    
+  }))         
+  
+  
+  cbind(semester=semester, vday_stats) %>%
+    select(semester, VDAY, n_terms, min_term, o_btw:c.bias_sd)
+  
+}))
+
+```
+
+```{r ARMA VDAY}
+
+arma_v_preds <- do.call(rbind, lapply(c("Spring", "Fall", "Summer"), function(semester) {
+  
+  # loop over semesters
+  print(paste("Semester: ", semester))
+
+  # get most up-to-date data for given semester
+  
+  info_max <- vday_sum %>% 
+    filter(TERM == max(TERM)) %>%
+    filter(VDAY == max(VDAY)) %>%
+    select(TERM, VDAY)
+  
+  
+  vday_stats <- do.call(rbind, lapply(c(-40:0), function(test.day) {
+    
+    # loop over vdays
+    print(paste("VDAY: ", test.day))
+    
+    # create time series including enrollment at specified VDAY
+    ts <- vday_sum %>%
+      filter(VDAY == test.day, SEMESTER %in% semester) %>%
+      mutate_at(vars(TERM_SEQUENCE), funs(. - 0.5)) %>%
+      select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH) %>%
+      rbind(vday_sum %>%
+              filter(VDAY == 0) %>% # vday 1
+              select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH)) %>%
+      arrange(TERM_SEQUENCE) %>%
+      mutate(head_diff1 = HEAD - lag(HEAD)) %>%
+      slice(-1) %>% # remove NA row due to lagged difference
+      filter(TERM != "201890") # remove current term (no VDAY 1!)
+    
+    # get max term for semester
+    
+    max_seq <- ts %>%
+      filter(SEMESTER %in% semester, VDAY == test.day) %>%
+      summarize(max(TERM_SEQUENCE)) %>%
+      pull()
+    
+    if(test.day == 0) max_seq <- max_seq - .5
+    
+    # fit model for testing
+    
+    base.ts <- ts %>% # restricted time series
+      filter(TERM_SEQUENCE <= max_seq)
+    
+    olist <- list(c(1, 1, 1), c(1, 1, 2), c(2, 1, 1), c(2, 1, 2))
+    
+    all_os <-  do.call(rbind, lapply(1:4, function(o_btw_seas) {
+      
+      do.call(rbind, lapply(1:4, function(o_win_seas) {
+        
+        # print("START BASE FIT")
+        # 
+        # print(paste("btw: ", o_btw_seas))
+        # print(paste("win: ", o_win_seas))
+        
+        # protect against failed ARIMA fits: return NA
+        
+        base_fit <- tryCatch(Arima(y=base.ts$head_diff1,
+                                   order=olist[[o_btw_seas]], 
+                                   seasonal = list(order=olist[[o_win_seas]], 
+                                                   period=3 + length(semester))),
+                             error=function(e) e)
+        
+        
+        if(inherits(base_fit, "error")) {
+          
+          return(data.frame(vday = test.day, o_btw = o_btw_seas, o_win = o_win_seas, 
+                            term_seq=base_seq + .5, lag=NA, bias_pct=NA)) 
+          
+        }
+        
+        # print("BASE FIT COMPLETE")
+        
+        # get number of terms available for prediction
+        n_terms <- ts %>%
+          filter(SEMESTER %in% semester, VDAY == test.day) %>% 
+          summarize(n()) %>% 
+          pull()
+        
+        if(test.day == 0 ) n_terms <- floor(n_terms/2)
+        
+        # loop through terms and get bias
+        
+        bias_pct <- do.call(rbind, lapply(0:(n_terms - ceiling(n_terms/2.5)), function(lag) {
+          
+          base_seq <- max_seq - lag * ifelse(length(semester) == 1, 3, 1)
+          
+          test.ts <- ts %>% # restricted time series
+            filter(TERM_SEQUENCE <= base_seq)
+          
+          head_base <- test.ts %>% 
+            filter(TERM_SEQUENCE == base_seq) %>%
+            select(HEAD) %>%
+            pull()
+          
+          # print(base_seq)
+          
+          head_actual <- ts %>% # actual headcount
+            filter(TERM_SEQUENCE == base_seq + .5) %>%
+            select(HEAD) %>% pull()
+          
+          if (length(head_base) == 0) {
+            return(data.frame(vday=test.day, o_btw = o_btw_seas, o_win = o_win_seas,
+              term_seq=base_seq + .5, lag=lag, bias_pct= NA))}
+          
+          fit <- tryCatch(Arima(y=test.ts$head_diff1, model = base_fit),
+                          error=function(e) e)
+          
+          if(inherits(fit, "error")) {
+            
+            return(data.frame(vday=test.day, o_btw = o_btw_seas, o_win = o_win_seas,
+              term_seq=base_seq + .5, lag=lag, bias_pct= NA))
+          }
+          # print("REFIT COMPLETE")
+          
+          head_pred <- predict(fit, n.ahead=1)$pred[1] + head_base
+          
+          data.frame(vday=test.day, o_btw = o_btw_seas, o_win = o_win_seas, 
+            term_seq=base_seq + 0.5, lag=lag,
+            bias_pct= (head_pred - head_actual) / head_actual)
+   
+          
+        }))
+        
+        
+      }))
+       
+      
+    })) %>% filter(!is.na(bias_pct))
+    
+    # get average and sd of error for all parameter combinations 
+    
+    o_stats <- all_os %>%
+      group_by(o_btw, o_win) %>%
+      summarize(bias_mean = mean(bias_pct, na.rm=TRUE), 
+        bias_sd = sd(bias_pct, na.rm=TRUE),
+        n_terms = n(),
+        min_term = min(term_seq)) %>%
+      ungroup() %>%
+      filter(bias_sd == min(bias_sd, na.rm=TRUE)) %>% 
+      mutate(VDAY = test.day)
+    
+    o_stats
+    
+  }))         
+  
+  
+  cbind(semester=semester, vday_stats) %>%
+    select(semester, VDAY, n_terms, min_term, o_btw:bias_sd)
+  
+}))
+
+```
+
+```{r ARMA VDAY2}
+
+arma_s_preds <- do.call(rbind, lapply(c("Spring", "Fall", "Summer"), function(semester) {
+  
+  # loop over semesters
+  print(paste("Semester: ", semester))
+
+  # get most up-to-date data for given semester
+  
+  info_max <- vday_sum %>% 
+    filter(TERM == max(TERM)) %>%
+    filter(VDAY == max(VDAY)) %>%
+    select(TERM, VDAY)
+  
+  # VDAY of interest about which to make predictions
+  voi <- 0
+  
+  vday_stats <- do.call(rbind, lapply(c(-30:-20), function(test.day) {
+    
+    # loop over vdays
+    print(paste("VDAY: ", test.day))
+    
+    # create time series including enrollment at specified VDAY
+    ts <- vday_sum %>%
+      filter(VDAY == test.day, SEMESTER %in% semester) %>%
+      mutate_at(vars(TERM_SEQUENCE), funs(. - 0.5)) %>%
+      select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH) %>%
+      rbind(vday_sum %>%
+              filter(VDAY == 0) %>% # vday 1
+              select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH)) %>%
+      arrange(TERM_SEQUENCE) %>%
+      mutate(head_diff1 = HEAD - lag(HEAD)) %>%
+      slice(-1) %>% # remove NA row due to lagged difference
+      filter(TERM != "201890") # remove current term (no VDAY 1!)
+    
+    # get max term for semester
+    
+    max_seq <- ts %>%
+      filter(SEMESTER %in% semester, VDAY == test.day) %>%
+      summarize(max(TERM_SEQUENCE)) %>%
+      pull()
+    
+    if(test.day == voi) max_seq <- max_seq - .5
+    
+    # fit model for testing
+    
+    base.ts <- ts %>% # restricted time series
+      filter(TERM_SEQUENCE <= max_seq)
+    
+    olist <- list(c(1, 1, 1), c(1, 1, 2), c(2, 1, 1), c(2, 1, 2))
+    
+    all_os <-  do.call(rbind, lapply(1:4, function(o_btw_seas) {
+      
+      do.call(rbind, lapply(1:4, function(o_win_seas) {
+        
+        # print("START BASE FIT")
+        # 
+        # print(paste("btw: ", o_btw_seas))
+        # print(paste("win: ", o_win_seas))
+        
+        # protect against failed ARIMA fits: return NA
+        
+        base_fit <- tryCatch(Arima(y=base.ts$head_diff1,
+                                   order=olist[[o_btw_seas]], 
+                                   seasonal = list(order=olist[[o_win_seas]], 
+                                                   period=3 + length(semester))),
+                             error=function(e) e)
+        
+        
+        if(inherits(base_fit, "error")) {
+          
+          return(data.frame(vday = test.day, o_btw = o_btw_seas, o_win = o_win_seas, 
+            term_seq=base_seq + .5, lag=NA, 
+            bias_pct_pred=NA, bias_pct_act=NA)) 
+          
+        }
+        
+        # print("BASE FIT COMPLETE")
+        
+        # get number of terms available for prediction
+        n_terms <- ts %>%
+          filter(SEMESTER %in% semester, VDAY == test.day) %>% 
+          summarize(n()) %>% 
+          pull()
+        
+        if(test.day == voi ) n_terms <- floor(n_terms/2)
+        
+        # loop through terms and get bias
+        
+        bias_pct <- do.call(rbind, lapply(0:(n_terms - ceiling(n_terms/2.5)), function(lag) {
+          
+          base_seq <- max_seq - lag * ifelse(length(semester) == 1, 3, 1)
+          
+          test.ts <- ts %>% # restricted time series
+            filter(TERM_SEQUENCE <= base_seq)
+          
+          head_base <- test.ts %>% 
+            filter(TERM_SEQUENCE == base_seq) %>%
+            select(HEAD) %>%
+            pull()
+          
+          # print(base_seq)
+          
+          head_actual <- ts %>% # actual headcount
+            filter(TERM_SEQUENCE == base_seq + .5) %>%
+            select(HEAD) %>% pull()
+          
+          if (length(head_base) == 0) {
+            return(data.frame(vday=test.day, o_btw = o_btw_seas, o_win = o_win_seas,
+              term_seq=base_seq + .5, lag=lag, bias_pct_pred= NA, bias_pct_act=NA))}
+          
+          fit <- tryCatch(Arima(y=test.ts$head_diff1, model = base_fit),
+                          error=function(e) e)
+          
+          if(inherits(fit, "error")) {
+            
+            return(data.frame(vday=test.day, o_btw = o_btw_seas, o_win = o_win_seas,
+              term_seq=base_seq + .5, lag=lag, bias_pct_pred= NA, bias_pct_act=NA))
+          }
+          # print("REFIT COMPLETE")
+          
+          head_pred <- predict(fit, n.ahead=1)$pred[1] + head_base
+          
+          data.frame(vday=test.day, o_btw = o_btw_seas, o_win = o_win_seas, 
+            term_seq=base_seq + 0.5, lag=lag,
+            bias_pct_pred= (head_pred - head_actual) / head_pred,
+            bias_pct_act = (head_pred - head_actual) / head_actual)
+   
+          
+        }))
+        
+        
+      }))
+       
+      
+    })) %>% filter(!is.na(bias_pct_pred))
+    
+    # get average and sd of error for all parameter combinations 
+    
+    o_stats <- all_os %>%
+      group_by(o_btw, o_win) %>%
+      summarize(bias_mean = mean(bias_pct_pred, na.rm=TRUE), 
+        bias_sd = sd(bias_pct_act, na.rm=TRUE),
+        n_terms = n(),
+        min_term = min(term_seq)) %>%
+      ungroup() %>%
+      filter(bias_sd == min(bias_sd, na.rm=TRUE)) %>% 
+      mutate(VDAY = test.day)
+    
+    o_stats
+    
+  }))         
+  
+  
+  cbind(semester=semester, vday_stats) %>%
+    select(semester, VDAY, n_terms, min_term, o_btw:bias_sd)
+  
+}))
+
+```
+
+```{r Enrollment Prediction Function}
+
+pred_enrl <- function(n_ahead=1, vday=0) {
+  
+  if(n_ahead > 3) simpleError("Algorithm only optimized for up to three terms!")
+  
+  # get most up-to-date enrollment information 
+  info_max <- vday_sum %>% 
+    filter(TERM == max(TERM)) %>%
+    filter(VDAY == max(VDAY)) %>%
+    select(TERM, VDAY, SEMESTER, TERM_SEQUENCE, HEAD) %>%
+    mutate_at(vars(TERM_SEQUENCE), funs(ifelse(VDAY < 0, . - .5, 
+      ifelse(VDAY > 0, . + .5, .))))
+  
+  # most advanced term with complete enrollment data given VDAY of interest
+  max_w_vday <- vday_sum %>%
+    filter(VDAY == vday) %>%
+    filter(TERM == max(TERM)) %>%
+    select(TERM, TERM_SEQUENCE, SEMESTER)
+  
+  by_term_sd <- do.call(rbind,lapply(1:n_ahead, function(n_ahead) {
+    
+    # vday with most up-to-date enrollment information  
+    test.day <- info_max %>% pull(VDAY)
+    
+    # create time series concatenating VDAY of interested (VOI) and test.day
+    ts <- vday_sum %>%
+      filter(VDAY == test.day, SEMESTER == info_max %>% pull(SEMESTER)) %>%
+      mutate_at(vars(TERM_SEQUENCE), funs(. - 0.5)) %>% # for ordering of series
+      select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH) %>%
+      rbind(vday_sum %>%
+          filter(VDAY == vday) %>% # vday of interest defined by user
+          select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH)) %>%
+      arrange(TERM_SEQUENCE) %>%
+      mutate(head_diff1 = HEAD - lag(HEAD)) %>%
+      slice(-1) %>% # remove NA row due to lagged differencing
+      filter(TERM <= max_w_vday %>% pull(TERM)) # terms with VOI only
+    
+    # get most advanced term including test.day/semester useful for prediction 
+    max_seq <- ts %>%
+      filter(SEMESTER == info_max %>% pull(SEMESTER), VDAY == test.day) %>%
+      summarize(max(TERM_SEQUENCE)) %>%
+      pull()
+    
+    # hardcode for case that VOI = test.day (stupid)
+    if(test.day == 0) max_seq <- max_seq - .5
+    
+    # restrict time series for optimizing prediction
+    base.ts <- ts %>% 
+      filter(TERM_SEQUENCE <= max_seq)
+    
+    # list of order parameters to loop over (AR, Diff, MA)
+    olist <- list(c(1, 1, 1), c(1, 1, 2), c(2, 1, 1), c(2, 1, 2))
+    
+    all_os <-  do.call(rbind, lapply(1:4, function(o_btw_seas) {
+      
+      do.call(rbind, lapply(1:4, function(o_win_seas) {
+        
+        # fit ARIMA model 
+        # protect against failed ARIMA fits: return NA
+        
+        base_fit <- tryCatch(Arima(y=base.ts$head_diff1,
+          order=olist[[o_btw_seas]], 
+          seasonal = list(order=olist[[o_win_seas]], 
+            period=3 + length(semester))),
+          error=function(e) e)
+        
+        # return empty data if model fails
+        if(inherits(base_fit, "error")) {
+          return(data.frame(o_btw = o_btw_seas, o_win = o_win_seas, 
+            vday = test.day, term=NA, bias_pct=NA))}
+        
+        # get number of time series subsets available for prediction
+        n_terms <- ts %>%
+          filter(SEMESTER == info_max %>% pull(SEMESTER), 
+            VDAY == test.day) %>% 
+          summarize(n()) %>% 
+          pull()
+        
+        # hardcode in case test.dat = VOI (stupid)
+        if(test.day == 0 ) n_terms <- floor(n_terms/2)
+        
+        # loop through time series subsets and refit model
+        bias_pct <- do.call(rbind, 
+          lapply(0:(n_terms - ceiling(n_terms/2.5)), function(lag) {
+            
+            # get sequence of term from which to predict (last term with data)                             
+            base_seq <- max_seq - 3*lag 
+            
+            # restrict time series to end with base_seq term
+            test.ts <- ts %>% 
+              filter(TERM_SEQUENCE <= base_seq)
+            
+            # get headcount at test.day for base_seq-term (most recent info)
+            head_base <- test.ts %>% 
+              filter(TERM_SEQUENCE == base_seq) %>%
+              select(HEAD) %>%
+              pull()
+            
+            # get actual headcount for term to be predicted
+            head_actual <- ts %>% # actual headcount
+              filter(TERM_SEQUENCE == base_seq + n_ahead - .5) %>%
+              select(HEAD) %>% pull()
+            
+            # return empty data if headcount for VDAY of interest is not recorded
+            if (length(head_base) == 0) return(data.frame(term=lag, bias_pct = NA))
+            
+            # refit model on time-series subset
+            fit <- tryCatch(Arima(y=test.ts$head_diff1, model = base_fit),
+              error=function(e) e)
+            
+            # return empty data if fit fails
+            if(inherits(fit, "error")) return(data.frame(term=lag, bias_pct= NA))
+            
+            # get prediction for term of interest
+            preds <- cumsum(predict(fit, n.ahead=n_ahead)$pred) + head_base
+            head_pred <- preds[n_ahead]
+            
+            data.frame(term=lag, bias_pct= (head_pred - head_actual) / head_actual)
+            
+          }))
+        
+        cbind(o_btw = o_btw_seas, o_win = o_win_seas, vday = test.day, bias_pct)
+        
+      }))
+      
+    })) %>% filter(!is.na(bias_pct))
+    
+    # get average and sd of error for all parameter combinations 
+    
+    o_stats <- all_os %>%
+      group_by(o_btw, o_win) %>%
+      summarize(bias_mean = mean(bias_pct, na.rm=TRUE), 
+        bias_sd = sd(bias_pct, na.rm=TRUE),
+        n_terms = n()) %>%
+      ungroup() %>%
+      filter(bias_sd == min(bias_sd, na.rm=TRUE)) %>% 
+      mutate(VDAY = test.day, n_ahead= n_ahead, 
+        test_semester=info_max %>% pull(SEMESTER)) %>%
+      select(n_ahead, test_semester, VDAY, o_btw:n_terms)
+    
+  }))         
+  
+  # create time series for current predictions
+  ts.pred <- vday_sum %>%
+    filter(VDAY == info_max %>% pull(VDAY), SEMESTER == info_max %>% pull(SEMESTER)) %>%
+    mutate_at(vars(TERM_SEQUENCE), funs(. - 0.5)) %>%
+    select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH) %>%
+    rbind(vday_sum %>%
+        filter(VDAY == vday) %>% # vday of interest
+        select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH)) %>%
+    arrange(TERM_SEQUENCE) %>%
+    mutate(head_diff1 = HEAD - lag(HEAD)) %>%
+    slice(-1) 
+  
+  # loop through prediction terms and use optimized models from above
+  preds_list <- do.call(rbind, lapply(1:n_ahead, function(pred_terms) {
+    
+    # get optimal order parameters
+    o_btw <- by_term_sd %>%
+      filter(as.integer(n_ahead) == as.integer(pred_terms)) %>%
+      pull(o_btw)
+    
+    o_win <- by_term_sd %>%
+      filter(n_ahead ==pred_terms) %>%
+      pull(o_win)
+    
+    # refit model
+    newfit <- Arima(y=ts$head_diff1, 
+      order=olist[[o_btw]], 
+      seasonal=list(order=olist[[o_win]], period=4))
+    
+    # get predictions
+    newpred <- cumsum(predict(newfit, n.ahead = pred_terms)$pred) + 
+      info_max %>% pull(HEAD)
+    
+    
+    ## FIX HERE DATA FRAME NOT WORKING
+    # last in series only and make data frame for rbind
+    data.frame(terms_ahead = pred_terms) %>%  
+      mutate(term_seq = info_max %>% pull(TERM_SEQUENCE) + pred_terms - .5,
+        hc_pred = round(newpred[pred_terms]),
+        hc_past = ts.pred %>% filter(TERM_SEQUENCE == term_seq-3) %>% pull(HEAD),
+        hc_pct_diff = (hc_pred - hc_past)/hc_past)
+    
+  }))
+  
+  return(preds_list)
+  
+}
+
+
+
+
+
+```
+
+```{r old ts code}
+
+# look at time series
+ts.plot(as.ts(ts$head_diff1))
+ts.plot(as.ts(ts$sch_diff1))
+
+# evaluate stationarity
+
+adf.test(ts$head_diff1) # fine
+adf.test(ts$sch_diff1)  # fine
+acf(ts$head_diff1) # seasonal
+pacf(ts$head_diff1) # good after 2 or 3
+
+acf(ts$sch_diff1) # seasonal
+pacf(ts$sch_diff1) # good after 2 or 3
+
+# specify ARMA model
+
+d = 1 # difference order 
+p = 1 # AR order
+q = 1 # MA order
+
+fit <- arima(x=ts$head_diff1,
+             order=c(p, d, q), 
+             seasonal = list(order=c(p, d, q), period=4))
+fit
+
+pred <- predict(fit, n.ahead=3*4)
+
+ts.plot(as.ts(ts$head_diff1), pred$pred, lty=c(1, 2))
+
+
+
+
+
+vday30.fall <- all_preds %>%
+  filter(VDAY == -30) %>%
+  inner_join(day1_hcs %>% select(TERM, term_seq =TERM_SEQUENCE))%>%
+  mutate_at(vars(term_seq), funs(as.numeric(.) - .5)) %>%
+  select(TERM, VDAY, term_seq, HEADCOUNT=VDAY_HEAD) %>%
+  rbind(day1_hcs %>% select(TERM, VDAY, term_seq = TERM_SEQUENCE, HEADCOUNT=HEAD )) %>%
+  mutate(SEMESTER = ifelse(substr(TERM, 5, 7)== "70", "F", ifelse(substr(TERM, 5, 7) == "80", "S", "R"))) %>%
+  arrange(term_seq) %>%
+  filter(term_seq >= 49.0, (VDAY == 1 | SEMESTER == "F")) %>%
+  mutate(hc_diff1 = HEADCOUNT - lag(HEADCOUNT)) %>%
+  filter(complete.cases(.), TERM != '201880') 
+
+```
+
+```{r}
+sday_pred_raw <- test_errs %>% filter(VDAY == -35) %>% select(SDAY_HC_PRED)
+
+sday_summer_bias <- pred_error %>% filter(VDAY == -35, stat == "SDAY", SEMESTER == "SUMMER") %>%
+  select(mean)
+
+sday_summer_error <- pred_error %>% filter(VDAY == -35, stat == "SDAY", SEMESTER == "SUMMER") %>%
+  select(sdt)
+
+sday_pred_corrected <- sday_pred_raw - ((sday_summer_bias/100) * sday_pred_raw) # 13880.71 predicted enrollment on DAY 1
+
+(sday_pred_corrected - vday_sum %>% filter(TERM == '201790', VDAY == 1) %>% select(HEAD))/
+  vday_sum %>% filter(TERM == '201790', VDAY == 1) %>% select(HEAD) # up 2.57%
+
+
+
+
+
+vday_pred_raw <- test_errs %>% filter(VDAY == -35) %>% select(VDAY_HC_PRED)
+
+vday_summer_bias <- pred_error %>% filter(VDAY == -35, stat == "VDAY", SEMESTER == "SUMMER") %>%
+  select(mean)
+
+sday_summer_error <- pred_error %>% filter(VDAY == -35, stat == "VDAY", SEMESTER == "SUMMER") %>%
+  select(sdt)
+
+vday_pred_corrected <- vday_pred_raw - ((vday_summer_bias/100) * vday_pred_raw) # 13880.71 predicted enrollment on DAY 1
+
+(vday_pred_corrected - vday_sum %>% filter(TERM == '201790', VDAY == 1) %>% select(HEAD))/
+  vday_sum %>% filter(TERM == '201790', VDAY == 1) %>% select(HEAD) # up 2.57%
+```
+
+```{r}
+## separate
+
+preds_list <- list(all_preds %>% select(TERM, SEMESTER, VDAY, BIAS = VDAY_ERR), 
+                   all_preds %>% select(TERM, SEMESTER, VDAY, BIAS = RDAY_ERR), 
+                   all_preds %>% select(TERM, SEMESTER, VDAY, BIAS = SDAY_ERR)) 
+names(preds_list) <- c("VDAY", "RDAY", "SDAY")
+
+nterms <- 14
+
+
+
+pred_error <- do.call(rbind, lapply(names(preds_list), function(stat) {
+  
+  bias_mean <- preds_list[[stat]] %>%
+    inner_join(preds_list[[stat]] %>%
+                 distinct(TERM) %>%
+                 slice((nrow(.) - nterms):nrow(.))) %>%
+    spread(key=VDAY, value=BIAS) %>%
+    group_by(SEMESTER) %>%
+    summarize_at(vars("-95":"-1"), funs(mean(., na.rm=TRUE))) %>%
+    select("-95":"-1") %>%
+    t() %>% as.data.frame %>%
+    mutate(VDAY = rownames(.)) %>%
+    as.tibble() %>%
+    rename(FALL=1, SUMMER=2, SPRING=3) %>%
+    mutate(bias_stat="bias_mean",
+           stat = stat)
+  
+  
+  bias_sd <- preds_list[[stat]] %>%
+    inner_join(preds_list[[stat]] %>%
+                 distinct(TERM) %>%
+                 slice((nrow(.) - nterms):nrow(.))) %>%
+    spread(key=VDAY, value=BIAS) %>%
+    group_by(SEMESTER) %>%
+    summarize_at(vars("-95":"-1"), funs(sd(., na.rm=TRUE))) %>%
+    select("-95":"-1") %>%
+    t() %>% as.data.frame %>%
+    mutate(VDAY = rownames(.)) %>%
+    as.tibble() %>%
+    rename(FALL=1, SUMMER=2, SPRING=3) %>%
+    mutate(bias_stat="bias_sd",
+           stat = stat)
+  
+  bias_n <- preds_list[[stat]] %>%
+    inner_join(preds_list[[stat]] %>%
+                 distinct(TERM) %>%
+                 slice((nrow(.) - nterms):nrow(.))) %>%
+    spread(key=VDAY, value=BIAS) %>%
+    group_by(SEMESTER) %>%
+    summarize_at(vars("-95":"-1"), funs(sum(!is.na(.)))) %>%
+    select("-95":"-1") %>%
+    t() %>% as.data.frame %>%
+    mutate(VDAY = rownames(.)) %>%
+    as.tibble() %>%
+    rename(FALL=1, SUMMER=2, SPRING=3) %>%
+    mutate(bias_stat="n",
+           stat = stat)
+  
+  rbind(bias_mean, bias_sd, bias_n) %>%
+    gather(key="SEMESTER", value="value", FALL:SPRING ) %>%
+    spread(key=bias_stat, value = value)
+  
+  
+})) %>% 
+  mutate(upper=bias_mean + dt(.975, n-1) * bias_sd/sqrt(n), 
+         lower=bias_mean - dt(.975, n-1) * bias_sd/sqrt(n),
+         sdt = dt(.975, n-1) * bias_sd/sqrt(n)) %>%
+  mutate_at(vars(VDAY), funs(as.numeric)) %>%
+  arrange(SEMESTER, stat, VDAY) %>%
+  select(-(n:sdt))
+
+```
+
+```{r Graphing Enrollment}
+png("H://onedrive/Enrollment_Impact/VDAY Predictions/vday_summer.png", width=700)
+
+vday_sum %>%
+  filter(TERM %in% c("201690", "201790")) %>%
+  ggplot() +
+  geom_line(aes(x=VDAY, y=HEAD, color=TERM), lwd=2) + 
+  geom_vline(xintercept = 1, lty=1) + 
+  geom_vline(xintercept=-75, lty=2) +
+  geom_vline(xintercept=-14, lty=2) +
+  geom_text(x=-80, y=7000, label = "-55%") + 
+  geom_text(x=-20, y=7000, label = "-5.4%") + 
+  geom_text(x=-5, y=7000, label = "-5.9%") + 
+  ggtitle(label = "VDAY: # days to day 1 of term") + 
+  theme(plot.title = element_text(hjust = .5))
+
+dev.off()
+
+png("H://onedrive/Enrollment_Impact/VDAY Predictions/rday_summer.png", width=700)
+
+vday_sum %>%
+  filter(TERM %in% c("201690", "201790")) %>%
+  ggplot() +
+  geom_line(aes(x=RDAY, y=HEAD, color=TERM), lwd=2) + 
+  # geom_vline(xintercept = 1, lty=1) + 
+  geom_vline(xintercept=5, lty=2) +
+  geom_vline(xintercept=75, lty=2) +
+  geom_text(x=5, y=7000, label = "-6.8%") + 
+  geom_text(x=75, y=7000, label = "8%") + 
+  # geom_text(x=-5, y=7000, label = "5.9%") + 
+  ggtitle(label = "RDAY: # day from registration start") + 
+  theme(plot.title = element_text(hjust = .5))
+
+dev.off()
+
+png("H://onedrive/Enrollment_Impact/VDAY Predictions/sday_summer.png", width=700)
+
+vday_sum %>%
+  filter(TERM %in% c("201690", "201790")) %>%
+  ggplot() +
+  geom_line(aes(x=SDAY, y=HEAD, color=TERM), lwd=2) + 
+  geom_vline(xintercept = 1, lty=1) + 
+  geom_vline(xintercept=.15, lty=2) +
+  geom_vline(xintercept=.85, lty=2) +
+  geom_text(x=.15, y=7000, label = "2%") +
+  geom_text(x=.85, y=7000, label = "-2%") +
+  geom_text(x=1, y=7000, label = "-5.9%") + 
+  ggtitle(label = "SDAY: VDAY scaled by length of registration period") + 
+  theme(plot.title = element_text(hjust = .5))
+
+dev.off()
+```
+
+```{r}
+## assessing statistics
+
+png("H://onedrive/Enrollment_Impact/VDAY Predictions/bias_stats.png", width=700)
+
+pred_error %>% 
+  mutate_at(vars(mean), funs(ifelse(stat=="VDAY" & VDAY < -40, NA, .))) %>%
+  filter(VDAY >= -40, (VDAY != -21 | SEMESTER != "SPRING")) %>%
+  ggplot() +
+  geom_line(aes(x=VDAY, y=mean, color=stat), lwd=2) +
+  geom_hline(yintercept = 0, lty=2, lwd=2) + 
+  facet_wrap(~ SEMESTER, scale="free")
+
+dev.off()
+
+
+png("H://onedrive/Enrollment_Impact/VDAY Predictions/variance_stats_tight.png", width=700)
+
+pred_error %>% 
+  mutate_at(vars(sdt), funs(ifelse(stat=="VDAY" & VDAY < -40, NA, .))) %>%
+  filter(VDAY >= -30, (VDAY != -21 | SEMESTER != "SPRING")) %>%
+  ggplot() +
+  geom_line(aes(x=VDAY, y=sdt, color=stat), lwd=2) +
+  geom_hline(yintercept = 0, lty=2, lwd=2) + 
+  facet_wrap(~ SEMESTER, scale="free")
+
+dev.off()
+
+
+
+```
+
+```{r Time Series Modeling By Season}
+
+# get time series
+
+by_term_sd <- lapply(c(Spring = "S", Fall = "F", Summer = "R"), function(semester) {
+  
+  test.day <- -30
+  
+  olist <- list(c(1, 1, 1), c(1, 1, 2), c(2, 1, 1), c(2, 1, 2))
+  
+  lapply(olist, function(order_btw_seas) {
+    
+    term_range <- vday_sum %>%
+      filter(VDAY==0) %>%
+      summarize(min = min(TERM_SEQUENCE),
+                max = max(TERM_SEQUENCE))  
+    
+    ts <- vday_sum %>%
+      filter(VDAY == test.day, SEMESTER %in% semester) %>%
+      mutate_at(vars(TERM_SEQUENCE), funs(. - 0.5)) %>%
+      select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH) %>%
+      rbind(vday_sum %>%
+              filter(VDAY == 0) %>% # vday 1
+              select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH)) %>%
+      arrange(TERM_SEQUENCE) %>%
+      mutate(log_head = log(HEAD),
+             log_sch = log(SCH),
+             head_diff1 = HEAD - lag(HEAD), 
+             sch_diff1 = SCH - lag(SCH),
+             log_head_diff1 = log_head - lag(log_head),
+             log_sch_diff1 = log_sch - lag(log_sch)) %>%
+      slice(-1) %>%
+      filter(TERM <= term_range %>% pull(max)) 
+    
+    
+    # get max seq for semester
+    
+    max_seq <- ts %>%
+      filter(SEMESTER %in% semester, VDAY == test.day) %>%
+      summarize(max(TERM_SEQUENCE)) %>%
+      pull()
+    
+    # fit model for testing
+    
+    base.ts <- ts %>% # restricted time series
+      filter(TERM_SEQUENCE <= max_seq)
+    
+    d = 1 # difference order 
+    p = 2 # AR order
+    q = 2 # MA order
+    
+    olist <- list(c(1, 1, 1), c(1, 1, 2), c(2, 1, 1), c(2, 1, 2))
+    
+    
+    base_fit <- Arima(y=base.ts$head_diff1,
+                      order=t.order, 
+                      seasonal = list(order=t.order, period=3 + length(semester)))
+    
+    
+    # get number of terms available for prediction
+    n_terms <- ts %>%
+      filter(SEMESTER %in% semester, VDAY == test.day) %>% 
+      summarize(n()) %>% 
+      pull()
+    
+    # loop through terms and get bias
+    
+    bias_pct <- sapply(0:(n_terms - ceiling(n_terms/2.5)), function(lag) {
+      
+      base_seq <- max_seq - lag * ifelse(length(semester) == 1, 3, 1)
+      
+      test.ts <- ts %>% # restricted time series
+        filter(TERM_SEQUENCE <= base_seq)
+      
+      head_base <- test.ts %>% 
+        filter(TERM_SEQUENCE == base_seq) %>%
+        select(HEAD) %>%
+        pull()
+      
+      head_actual <- ts %>% # actual headcount
+        filter(TERM_SEQUENCE == base_seq + .5) %>%
+        select(HEAD) %>% pull()
+      
+      
+      fit <- arima(x=test.ts$head_diff1, 
+                   order = order_btw_seas, 
+                   seasonal=list(order=order_win_seas, period = 4))
+      
+      head_pred <- predict(fit, n.ahead=1)$pred[1] + head_base
+      
+      (head_pred - head_actual) / head_actual
+      
+    })
+    
+    sd(bias_pct)
+    
+  })
+  
+})
+
+
+
+```
+
+```{r Time Series Modeling All Seasons}
+# get time series
+
+olist <- list(c(1, 1, 1), c(1, 1, 2), c(2, 1, 1))
+
+order_bias <- lapply(olist, function(t.order) {
+  
+  print(t.order)
+  test.day <- -30
+  semester <- c("S", "F", "R")
+  
+  ts <- vday_sum %>%
+    filter(VDAY == test.day, SEMESTER %in% semester) %>%
+    mutate_at(vars(TERM_SEQUENCE), funs(. - 0.5)) %>%
+    select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH) %>%
+    rbind(vday_sum %>%
+            filter(VDAY == 0) %>% # vday 1
+            select(TERM, TERM_SEQUENCE, SEMESTER, VDAY, HEAD, SCH)) %>%
+    arrange(TERM_SEQUENCE) %>%
+    mutate(log_head = log(HEAD),
+           log_sch = log(SCH),
+           head_diff1 = HEAD - lag(HEAD), 
+           sch_diff1 = SCH - lag(SCH),
+           log_head_diff1 = log_head - lag(log_head),
+           log_sch_diff1 = log_sch - lag(log_sch)) %>%
+    slice(-1) %>%
+    filter(TERM != "201890") # remove current term (no VDAY 1!)
+  
+  
+  # get max seq for semester
+  
+  max_seq <- ts %>%
+    filter(SEMESTER %in% semester, VDAY == test.day) %>%
+    summarize(max(TERM_SEQUENCE)) %>%
+    pull()
+  
+  # fit model for testing
+  
+  base.ts <- ts %>% # restricted time series
+    filter(TERM_SEQUENCE <= max_seq)
+  
+  d = 2 # difference order 
+  p = 1 # AR order
+  q = 2 # MA order
+  
+  base_fit <- Arima(y=base.ts$head_diff1,
+                    order=t.order, 
+                    seasonal = list(order=t.order, period=3 + length(semester)))
+  
+  
+  # get number of terms available for prediction
+  n_terms <- ts %>%
+    filter(SEMESTER %in% semester, VDAY == test.day) %>% 
+    summarize(n()) %>% 
+    pull()
+  
+  # loop through terms and get bias
+  
+  bias_pct <- sapply(0:(n_terms - ceiling(n_terms/2.5)), function(lag) {
+    
+    base_seq <- max_seq - lag * ifelse(length(semester) == 1, 3, 1)
+    
+    test.ts <- ts %>% # restricted time series
+      filter(TERM_SEQUENCE <= base_seq)
+    
+    head_base <- test.ts %>% 
+      filter(TERM_SEQUENCE == base_seq) %>%
+      select(HEAD) %>%
+      pull()
+    
+    head_actual <- ts %>% # actual headcount
+      filter(TERM_SEQUENCE == base_seq + .5) %>%
+      select(HEAD) %>% pull()
+    
+    
+    fit <- Arima(y=test.ts$head_diff1, model = base_fit)
+    
+    head_pred <- predict(fit, n.ahead=1)$pred[1] + head_base
+    
+    (head_pred - head_actual) / head_actual
+    
+  })
+  
+  bias_pct
+  
+})
+
+all_sem_sds <- lapply(order_bias, function(x) {
+  
+  list(spring=sd(x[seq(from=1, length.out=5, by=3)]),
+       summer=sd(x[seq(from=2, length.out=5, by=3)]),
+       fall = sd(x[seq(from=1, length.out=5, by=3)]))
+})
+
+
+```
+
+```{r Get Estimates for Fall 2016 2017 }
+
+base <- "201570"
+test <- "201670"
+
+# vday estimates
+vday_head <- vday_sum %>%
+  filter(TERM %in% c(base, test)) %>%
+  select(TERM, HEAD, VDAY) %>%
+  spread(key = TERM, value = HEAD) %>%
+  rename(F16_HC = base,
+         F17_HC = test) %>%
+  mutate(HC_DIFF_PCT    = (F17_HC - F16_HC) / F16_HC) %>%
+  mutate(HC_PRED = term_stats[term_stats$TERM == base, "HEAD_START"] + 
+           (HC_DIFF_PCT * term_stats[term_stats$TERM == base, "HEAD_START"])) %>%
+  mutate(VDAY_ERR = 100 * (HC_PRED - term_stats[term_stats$TERM == test, "HEAD_START"])/ 
+           term_stats[term_stats$TERM == test, "HEAD_START"]) %>%
+  select(VDAY, VDAY_ERR)
+
+# rday estimates
+rday_head <- vday_sum %>%
+  filter(TERM %in% c(base, test)) %>%
+  select(TERM, HEAD, RDAY) %>%
+  spread(key = TERM, value = HEAD) %>%
+  rename(F16_HC = base,
+         F17_HC = test) %>%
+  mutate(HC_DIFF_PCT    = (F17_HC - F16_HC) / F16_HC) %>%
+  mutate(HC_PRED = term_stats[term_stats$TERM == base, "HEAD_START"] + 
+           (HC_DIFF_PCT * term_stats[term_stats$TERM == base, "HEAD_START"])) %>%
+  mutate(RDAY_ERR =  100 * (HC_PRED - term_stats[term_stats$TERM == test, "HEAD_START"])/ 
+           term_stats[term_stats$TERM == test, "HEAD_START"]) %>%
+  select(RDAY, RDAY_ERR)
+
+# sday estimates
+sday_head_full <- vday_sum %>%
+  filter(TERM %in% c(base, test),
+         VDAY <= 1) %>%
+  select(TERM, HEAD, VDAY) %>%
+  group_by(TERM) %>%
+  mutate(SDAY = round(1- (VDAY/(min(VDAY))), 4)) %>%
+  mutate_at(vars(SDAY), funs(ifelse(VDAY == 1, 1, .))) %>%
+  mutate(base_diff = lead(HEAD) - HEAD,
+         sday_lead = lead(SDAY),
+         sday_diff = lead(SDAY) - SDAY)
+
+sday_head_base <- sday_head_full %>%
+  filter(TERM == base) %>%
+  mutate(key="A")
+sday_head_test <- sday_head_full %>%
+  filter(TERM == test) %>%
+  mutate(key="A")
+
+
+sday_head <- sday_head_base %>%
+  full_join(sday_head_test, by="key") %>%
+  filter(SDAY.y >= SDAY.x, SDAY.y < sday_lead.x) %>%
+  mutate(hc_inter = HEAD.x + (base_diff.x * (SDAY.y - SDAY.x) / sday_diff.x),
+         HC_DIFF_PCT = (HEAD.y - hc_inter) / hc_inter,
+         HC_PRED = term_stats[term_stats$TERM == base, "HEAD_START"] + 
+           (HC_DIFF_PCT * term_stats[term_stats$TERM == base, "HEAD_START"]),
+         SDAY_ERR =  100 * (HC_PRED - term_stats[term_stats$TERM == test, "HEAD_START"])/ 
+           term_stats[term_stats$TERM == test, "HEAD_START"]) %>%
+  ungroup() %>%
+  select(SDAY = SDAY.y, 
+         SDAY_ERR)
+
+# combine for plotting
+test_errs <-  vday_sum %>%
+  filter(TERM == test) %>%
+  select(DDAY, VDAY, RDAY, SDAY) %>%
+  inner_join(vday_head) %>%
+  inner_join(rday_head) %>%
+  inner_join(sday_head) %>%
+  gather(key="estimate", value="error", VDAY_ERR, RDAY_ERR, SDAY_ERR)
+
+test_errs %>%
+  filter(between(VDAY, -60, 1)) %>%
+  ggplot() +
+  geom_line(aes(x=VDAY, y=error, color=estimate))
+
+
+```
+
+```{r ARIMA Function}
+
+y <- ts %>%
+  mutate_at(vars(SEMESTER), funs(ifelse(VDAY != 0, paste("V_", ., sep=""), .)))
+
+arima.xval <- function(ts, season, predict, vals, predict.with) {
+  
+  ts <- y
+  
+  predict="Summer"
+  predict.with="V_Summer"
+  vals="head_diff1"
+  season="SEMESTER"
+  
+  # if seasonal
+  if(!is.null(season)) {
+    
+    # get number of seasons 
+  n_seas <- y %>%
+    summarize(n_distinct(get(season))) %>%
+    pull()
+    
+    # get number of years per season
+  n_year <- y %>%
+    group_by(season = get(season)) %>%
+    summarize(n_year = n())
+
+  } else n_year <- nrow(y)
+  
+  
+  o_btw <- c(1, 1, 1)
+  o_win <- c(1, 1, 1)
+  
+  # trim so last point is truth of interest, using ignore 
+  while(!y %>% select(season) %>% slice(nrow(.)) %>% pull() %in% predict) {
+    y <- y %>%
+      slice(-nrow(.))
+  }
+  
+  olist <- list(c(1, 1, 1), c(1, 1, 2), c(2, 1, 1), c(2, 1, 2))
+  
+    while(ts %>% slice(nrow(.)) %>% select(season) %>% pull() != predict.with) {
+        
+        ts <- ts %>%
+          slice(1:(nrow(.) - 1))
+      }
+  
+  pred_errors <- do.call(rbind, lapply(1:4, function(o_btws) {
+    
+    do.call(rbind, lapply(1:4, function(o_wins) {
+      
+    
+      
+          base.fit <- tryCatch(Arima(ts %>% select(vals), order=olist[[o_btws]], 
+      seasonal=list(order=olist[[o_wins]], period=n_seas)), error=function(e) e)
+          
+          if(inherits(base.fit, "error")) {return(data.frame(dummy=FALSE, o_btw=olist[[o_btws]], 
+            o_win = olist[[o_wins]],
+        n_years=NA, actual=NA, 
+        pred=NA, c.pred=NA, c.error=NA, c.error_pct_pred=NA, c.error_pct_act=NA,
+        error_pct_pred=NA, error_pct_act=NA))}
+      
+      xval_out <- data.frame(dummy=FALSE, o_btw=0, o_win = 0,
+        n_years=NA, actual=NA, 
+        pred=NA, c.pred=NA, c.error=NA, c.error_pct_pred=0, c.error_pct_act=0,
+        error_pct_pred=0, error_pct_act=0)
+  
+  for(i in 1:(n_year %>% 
+      filter(season == predict) %>% 
+      select(n_year)  %>% 
+      pull())) {
+    
+    # trim to iterated number of years
+    trim <- y %>% 
+      slice(1:(nrow(.) - ((n_year %>% 
+          filter(season == predict) %>% 
+          select(n_year)  %>% 
+          pull()) - i) * n_seas))
+    
+   # actual value (not differenced)
+        actual <- trim %>%
+      slice(nrow(.)) %>%
+      select(HEAD) %>% pull()
+    
+    # training set for prediction
+    train <- trim
+    n_ahead = 0
+    while(train %>% slice(nrow(.)) %>% select(season) != predict.with) {
+      
+      train <- train %>%
+        slice(1:(nrow(.) - 1))
+      n_ahead <- n_ahead + 1
+      
+    }
+    
+    # base value (not differenced)
+    base <- train %>%
+      slice(nrow(.)) %>%
+      select(HEAD) %>% pull()
+    
+    # fit to time series subset, skip if error
+    refit <- tryCatch(Arima(train %>% select(vals), model=base.fit), error=function(e) e)
+    
+    # skip if error
+    if(inherits(refit, "error")) next()
+    
+    prediction.raw <- predict(refit, n.ahead=n_ahead)$pred[n_ahead] + base
+    prediction.corr <- prediction.raw - (xval_out %>% 
+      summarize(bias_mean = mean(c.error_pct_pred, na.rm=TRUE)) %>% pull() * prediction.raw) 
+    
+    error.raw <- prediction.raw - actual
+    error.raw_pred_pct <- error.raw/prediction.raw
+    error.raw_act_pct  <- error.raw/actual
+    error <- prediction.corr - actual
+    error_pct_pred <- error/prediction.corr
+    error_pct_act <- error/actual
+    
+    xval_out[i, ] <- c(TRUE, o_btws, o_wins,
+      i, actual, prediction.raw, prediction.corr, error, error_pct_pred, error_pct_act, 
+      error.raw_pred_pct, error.raw_act_pct)
+    
+    if(nrow(xval_out) > 1) xval_out <- xval_out %>% filter(dummy==TRUE)
+    
+  } # end of iterative bias mean loop
+      
+      xval_out %>% select(-dummy)
+      
+    })) # end of o_win, do.call
+    
+  })) # end of o_btw, do.call
+  
+} # end of arima function
+
+arima.xval(y=y, season="SEMESTER")
+
+pred_errors %>%
+  group_by(o_btw, o_win) %>%
+  summarize(r.bias_mean =mean(error_pct_pred), 
+    r.bias_sd=sd(error_pct_act), 
+    c.bias_mean=mean(c.error_pct_pred), 
+    c.bias_sd = sd(c.error_pct_act))
+```
+
